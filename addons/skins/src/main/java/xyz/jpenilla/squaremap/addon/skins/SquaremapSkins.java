@@ -4,9 +4,17 @@ import com.destroystokyo.paper.profile.PlayerProfile;
 import com.destroystokyo.paper.profile.ProfileProperty;
 import java.awt.image.BufferedImage;
 import java.io.File;
-import java.io.IOException;
-import java.net.URL;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URLConnection;
 import java.util.Base64;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import javax.imageio.ImageIO;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -21,8 +29,17 @@ import org.json.simple.parser.JSONParser;
 import xyz.jpenilla.squaremap.api.SquaremapProvider;
 
 public final class SquaremapSkins extends JavaPlugin {
+    private static final int HTTP_CONNECT_TIMEOUT_MILLIS = 5000;
+    private static final int HTTP_READ_TIMEOUT_MILLIS = 10000;
+
     private static SquaremapSkins instance;
     private static File skinsDir;
+
+    // Downloads run on a single dedicated thread instead of the shared Bukkit async
+    // pool - a slow or unresponsive texture server must never pile up scheduler threads.
+    private ExecutorService downloadExecutor;
+    private final Map<UUID, String> savedTextureUrls = new ConcurrentHashMap<>();
+    private final Set<UUID> inFlight = ConcurrentHashMap.newKeySet();
 
     public SquaremapSkins() {
         instance = this;
@@ -40,6 +57,12 @@ public final class SquaremapSkins extends JavaPlugin {
             return;
         }
 
+        this.downloadExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "squaremap-skins-downloader");
+            thread.setDaemon(true);
+            return thread;
+        });
+
         getServer().getPluginManager().registerEvents(new Listener() {
             @EventHandler(priority = EventPriority.MONITOR)
             public void onPlayerJoin(PlayerJoinEvent event) {
@@ -47,8 +70,24 @@ public final class SquaremapSkins extends JavaPlugin {
             }
         }, this);
 
-        int interval = getConfig().getInt("update-interval", 60);
+        // update-interval is documented in seconds; convert to ticks.
+        long interval = getConfig().getInt("update-interval", 60) * 20L;
         new UpdateTask().runTaskTimer(instance, interval, interval);
+    }
+
+    @Override
+    public void onDisable() {
+        if (this.downloadExecutor != null) {
+            this.downloadExecutor.shutdownNow();
+            try {
+                this.downloadExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            this.downloadExecutor = null;
+        }
+        this.savedTextureUrls.clear();
+        this.inFlight.clear();
     }
 
     private static class UpdateTask extends BukkitRunnable {
@@ -75,24 +114,31 @@ public final class SquaremapSkins extends JavaPlugin {
             if (url == null || url.isEmpty()) {
                 return;
             }
-            String name = player.getName();
-            new SaveSkin(name, url).runTaskAsynchronously(instance);
+            instance.queueDownload(player.getUniqueId(), player.getName(), url);
         }
     }
 
-    private static final class SaveSkin extends BukkitRunnable {
-        private final String name;
-        private final String url;
-
-        private SaveSkin(String name, String url) {
-            this.name = name;
-            this.url = url;
+    private void queueDownload(UUID playerId, String name, String url) {
+        if (url.equals(this.savedTextureUrls.get(playerId)) && new File(skinsDir, name + ".png").isFile()) {
+            return;
         }
-
-        @Override
-        public void run() {
-            instance.saveTexture(name, url);
+        if (!this.inFlight.add(playerId)) {
+            return;
         }
+        ExecutorService executor = this.downloadExecutor;
+        if (executor == null) {
+            this.inFlight.remove(playerId);
+            return;
+        }
+        executor.execute(() -> {
+            try {
+                if (saveTexture(name, url)) {
+                    this.savedTextureUrls.put(playerId, url);
+                }
+            } finally {
+                this.inFlight.remove(playerId);
+            }
+        });
     }
 
     private static String getTexture(Player player) {
@@ -115,13 +161,26 @@ public final class SquaremapSkins extends JavaPlugin {
         return null;
     }
 
-    private void saveTexture(String name, String url) {
+    private boolean saveTexture(String name, String url) {
         try {
-            BufferedImage img = ImageIO.read(new URL(url)).getSubimage(8, 8, 8, 8);
+            URLConnection connection = URI.create(url).toURL().openConnection();
+            connection.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MILLIS);
+            connection.setReadTimeout(HTTP_READ_TIMEOUT_MILLIS);
+            BufferedImage skin;
+            try (InputStream in = connection.getInputStream()) {
+                skin = ImageIO.read(in);
+            }
+            if (skin == null) {
+                this.getSLF4JLogger().warn("Could not decode texture {} for {}", url, name);
+                return false;
+            }
+            BufferedImage img = skin.getSubimage(8, 8, 8, 8);
             File file = new File(skinsDir, name + ".png");
             ImageIO.write(img, "png", file);
+            return true;
         } catch (Exception e) {
             this.getSLF4JLogger().info("Could not save texture {} to {}", url, new File(skinsDir, name + ".png"), e);
+            return false;
         }
     }
 }
