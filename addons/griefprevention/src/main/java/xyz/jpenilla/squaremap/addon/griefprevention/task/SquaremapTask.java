@@ -4,12 +4,14 @@ import java.awt.Color;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import me.ryanhamshire.GriefPrevention.Claim;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
-import org.bukkit.OfflinePlayer;
 import org.bukkit.World;
+import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitRunnable;
 import xyz.jpenilla.squaremap.addon.griefprevention.SquaremapGriefPrevention;
 import xyz.jpenilla.squaremap.addon.griefprevention.hook.GPHook;
@@ -101,18 +103,38 @@ public final class SquaremapTask extends BukkitRunnable {
         this.provider.addMarker(Key.of(markerid), rect);
     }
 
+    // OfflinePlayer#getName loads the player's data file from disk when they are offline; with
+    // this task re-running for every claim every update cycle that adds up to constant disk I/O.
+    // Resolve each UUID once and cache the result.
+    private static final Map<UUID, String> NAME_CACHE = new ConcurrentHashMap<>();
+
     private static String getNames(List<String> list) {
         List<String> names = new ArrayList<>();
         for (String str : list) {
             try {
                 UUID uuid = UUID.fromString(str);
-                OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(uuid);
-                names.add(offlinePlayer.getName());
+                names.add(resolveName(uuid));
             } catch (Exception e) {
                 names.add(str);
             }
         }
         return String.join(", ", names);
+    }
+
+    private static String resolveName(UUID uuid) {
+        Player online = Bukkit.getPlayer(uuid);
+        if (online != null) {
+            // Cheap, and keeps the cache current if the player's name changed
+            String name = online.getName();
+            NAME_CACHE.put(uuid, name);
+            return name;
+        }
+        // Cache the fallback too - players with no data file would otherwise hit the disk again
+        // on every cycle
+        return NAME_CACHE.computeIfAbsent(uuid, id -> {
+            String name = Bukkit.getOfflinePlayer(id).getName();
+            return name != null ? name : id.toString();
+        });
     }
 
     public void disable() {
